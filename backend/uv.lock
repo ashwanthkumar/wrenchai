@@ -3532,6 +3532,18 @@ wheels = [
 ]
 
 [[package]]
+name = "unsiloed-sdk"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/97/f39b08141c058e131c9dd9ddaf55f21b731a30a26df738ab43d2226ea08f/unsiloed_sdk-0.1.7.tar.gz", hash = "sha256:94d66ce8802ccdd815f0f7172309ce4eed25186873511377aa66cb9150cd0ea8", size = 103150, upload-time = "2026-03-10T17:45:02.729Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/28/ba65722340cda50f234d4845045ff81e90ef03860551376b9fbfced771f4/unsiloed_sdk-0.1.7-py3-none-any.whl", hash = "sha256:b96e26381f70d39b05f8636c80d31ee664217f51084c39f3a6ae556692372531", size = 14180, upload-time = "2026-03-10T17:45:01.087Z" },
+]
+
+[[package]]
 name = "urllib3"
 version = "2.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3773,6 +3785,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "sentence-transformers" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "unsiloed-sdk" },
     { name = "uvicorn" },
 ]
 
@@ -3795,6 +3808,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "sentence-transformers", specifier = ">=3.0.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
+    { name = "unsiloed-sdk", specifier = ">=0.1.7" },
     { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 
