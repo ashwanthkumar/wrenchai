@@ -9,6 +9,8 @@ Usage:
 """
 
 import argparse
+import asyncio
+import base64
 import json
 import os
 import shutil
@@ -31,11 +33,22 @@ from claude_agent_sdk import (
     query as claude_query,
     AssistantMessage,
     TextBlock,
+    ToolUseBlock,
+    ToolResultBlock,
+    UserMessage,
+    SystemMessage,
     ResultMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
 )
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Session store for persistent WebSocket conversations
+# ---------------------------------------------------------------------------
+_sessions: dict[str, ClaudeSDKClient] = {}
+_sessions_lock = asyncio.Lock()
 
 CHROMA_DIR = Path(__file__).parent / "chroma_db"
 COLLECTION_NAME = "vehicle_manual"
@@ -157,7 +170,7 @@ async def _ask_claude(question: str, image_paths: list[Path] | None = None) -> M
 # ---------------------------------------------------------------------------
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -171,6 +184,13 @@ async def lifespan(app: FastAPI):
     _collection = client.get_collection(name=COLLECTION_NAME, embedding_function=voyage_ef)
     IMAGES_DIR.mkdir(exist_ok=True)
     yield
+    # Shutdown: disconnect all persistent sessions
+    for client in _sessions.values():
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    _sessions.clear()
 
 
 app = FastAPI(title="Vehicle Manual Q&A", lifespan=lifespan)
@@ -200,6 +220,108 @@ async def query_endpoint(
 
     answer = await _ask_claude(question, image_paths=image_paths)
     return QueryResponse(answer=answer)
+
+
+async def _get_or_create_session(session_id: str) -> ClaudeSDKClient:
+    """Return an existing ClaudeSDKClient for session_id, or create a new one."""
+    async with _sessions_lock:
+        if session_id in _sessions:
+            return _sessions[session_id]
+
+        opts = ClaudeAgentOptions(
+            model="claude-sonnet-4-6",
+            system_prompt=SYSTEM_PROMPT,
+            mcp_servers={"manual": _manual_server},
+            allowed_tools=["mcp__manual__search_manual", "Read"],
+            permission_mode="default",
+            add_dirs=[str(IMAGES_DIR)],
+            extra_args={"debug-to-stderr": None},
+            stderr=lambda line: print(line, file=sys.stderr),
+        )
+        client = ClaudeSDKClient(options=opts)
+        await client.connect()
+        _sessions[session_id] = client
+        return client
+
+
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    try:
+        client = await _get_or_create_session(session_id)
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
+
+            if data.get("type") != "message":
+                await websocket.send_json({"type": "error", "message": f"Unknown message type: {data.get('type')}"})
+                continue
+
+            text = data.get("text", "")
+
+            # Handle base64 images: decode, save, and prepend @path refs
+            image_refs = []
+            for img in data.get("images", []):
+                img_data = base64.b64decode(img["data"])
+                filename = f"{uuid.uuid4().hex}_{img.get('filename', 'image.jpg')}"
+                dest = IMAGES_DIR / filename
+                dest.write_bytes(img_data)
+                image_refs.append(f"@{dest.resolve()}")
+
+            prompt = f"{' '.join(image_refs)} {text}" if image_refs else text
+
+            start_time = time.monotonic()
+            try:
+                await client.query(prompt)
+                async for msg in client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                await websocket.send_json({"type": "assistant_text", "text": block.text})
+                            elif isinstance(block, ToolUseBlock):
+                                await websocket.send_json({
+                                    "type": "tool_use",
+                                    "tool": block.name,
+                                    "input": block.input,
+                                })
+                    elif isinstance(msg, UserMessage):
+                        if isinstance(msg.content, list):
+                            for block in msg.content:
+                                if isinstance(block, ToolResultBlock):
+                                    content = block.content
+                                    if isinstance(content, list):
+                                        content = json.dumps(content)
+                                    await websocket.send_json({
+                                        "type": "tool_result",
+                                        "tool_use_id": block.tool_use_id,
+                                        "content": content or "",
+                                    })
+                    elif isinstance(msg, ResultMessage):
+                        duration_ms = int((time.monotonic() - start_time) * 1000)
+                        await websocket.send_json({
+                            "type": "result",
+                            "cost_usd": msg.total_cost_usd,
+                            "duration_ms": duration_ms,
+                        })
+            except Exception as e:
+                await websocket.send_json({"type": "error", "message": str(e)})
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Clean up session on disconnect
+        async with _sessions_lock:
+            removed = _sessions.pop(session_id, None)
+        if removed:
+            try:
+                await removed.disconnect()
+            except Exception:
+                pass
 
 
 def ingest(pdf_path: str) -> None:
