@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.admin.pages import setup_admin_pages
 from app.api.deps import set_rag_service, set_session_manager
 from app.api.router import api_router
 from app.config import settings
@@ -37,6 +38,12 @@ async def lifespan(app: FastAPI):
     await session_manager.start_cleanup_task()
     set_session_manager(session_manager)
 
+    # Register NiceGUI admin pages
+    setup_admin_pages(
+        db_session_factory=async_session,
+        rag_service=rag_service,
+    )
+
     yield
 
     await session_manager.close_all()
@@ -44,6 +51,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="WrenchAI", lifespan=lifespan)
 app.include_router(api_router)
+
+
+def init_nicegui():
+    """Initialize NiceGUI mounted under /admin."""
+    from nicegui import ui
+    ui.run_with(app, mount_path="/admin", storage_secret=settings.storage_secret)
+
+
+init_nicegui()
 
 
 def main():
