@@ -21,7 +21,7 @@ This is a hackathon project. Prioritize shipping speed over perfection.
 │                         │         │                              │
 │  AVAudioEngine pipeline │         │  /admin (NiceGUI)            │
 └─────────────────────────┘         │     ├─ Upload PDFs           │
-                                    │     ├─ Docling processing    │
+                                    │     ├─ Unsiloed.ai parsing   │
                                     │     └─ Browse content        │
                                     └──────────────────────────────┘
 ```
@@ -34,7 +34,7 @@ This is a hackathon project. Prioritize shipping speed over perfection.
 - **uv** for dependency management
 - **FastAPI** for REST API
 - **NiceGUI** for admin frontend (mounted at `/admin`)
-- **Docling** for PDF → structured markdown
+- **Unsiloed.ai** (`unsiloed-sdk`) for PDF → structured markdown/chunks via API
 - **ChromaDB** + **sentence-transformers** for RAG
 - **Anthropic SDK** for Claude conversations
 - **SQLite** (via SQLAlchemy async) for metadata
@@ -69,7 +69,7 @@ backend/
 │   │   ├── pages.py               # NiceGUI pages: login, dashboard, browse
 │   ├── services/
 │   │   ├── __init__.py
-│   │   ├── pdf_processor.py       # Docling pipeline
+│   │   ├── pdf_processor.py       # Unsiloed.ai parse + poll pipeline
 │   │   ├── rag.py                 # ChromaDB + embeddings
 │   │   ├── llm.py                 # Anthropic SDK wrapper
 │   │   └── firebase_auth.py       # Firebase token verification
@@ -87,7 +87,7 @@ backend/
 ### Key Files & Implementation Details
 
 #### `pyproject.toml`
-Dependencies: `fastapi`, `uvicorn[standard]`, `nicegui>=2.0`, `sqlalchemy`, `aiosqlite`, `pydantic-settings`, `anthropic`, `docling`, `chromadb`, `sentence-transformers`, `firebase-admin`, `python-multipart`, `passlib[bcrypt]`
+Dependencies: `fastapi`, `uvicorn[standard]`, `nicegui>=2.0`, `sqlalchemy`, `aiosqlite`, `pydantic-settings`, `anthropic`, `unsiloed-sdk`, `chromadb`, `sentence-transformers`, `firebase-admin`, `python-multipart`, `passlib[bcrypt]`
 
 #### `app/main.py` - Entry Point
 - Create FastAPI app with lifespan (init DB, init RAG on startup)
@@ -104,14 +104,31 @@ Dependencies: `fastapi`, `uvicorn[standard]`, `nicegui>=2.0`, `sqlalchemy`, `aio
 | `sessions` | id (UUID), user_id (Firebase UID), manual_id (FK), title |
 | `messages` | id (UUID), session_id (FK), role (user/assistant), content, rag_context (JSON) |
 
-#### `app/services/pdf_processor.py` - PDF Pipeline
-1. Use `docling.DocumentConverter` to convert PDF → structured document
-2. Export to markdown via `result.document.export_to_markdown()`
-3. Extract images from figures
-4. Chunk by H2 headers, target 500-800 tokens per chunk, ~100 token overlap
-5. Each chunk carries metadata: manual_id, section_title, chunk_index
-6. Index chunks into ChromaDB via `rag.index_chunks()`
-7. Run in `asyncio.to_thread()` since Docling is CPU-intensive
+#### `app/services/pdf_processor.py` - PDF Pipeline (Unsiloed.ai)
+Uses the Unsiloed.ai API (`unsiloed-sdk`) for cloud-based document parsing. Async, job-based workflow:
+
+1. Upload PDF via `client.parse_and_wait(file=path)` (handles submit + polling internally)
+2. SDK returns chunks with `embed` (text for embedding), markdown, HTML, segments, and layout metadata
+3. Each chunk includes segment types: Title, SectionHeader, Text, ListItem, Table, Picture, Caption, etc.
+4. Map chunks to ChromaDB documents: use `chunk['embed']` as the document text, attach metadata (manual_id, chunk_index, segment_types)
+5. Index chunks into ChromaDB via `rag.index_chunks()`
+6. Store raw markdown in `data/processed/{manual_id}.md` for admin browse view
+
+```python
+from unsiloed_sdk import UnsiloedClient
+
+async def process_pdf(file_path: str, manual_id: str):
+    with UnsiloedClient(api_key=settings.unsiloed_api_key) as client:
+        result = client.parse_and_wait(file=file_path)
+        chunks = [
+            {"text": chunk["embed"], "metadata": {"manual_id": manual_id, "chunk_index": i}}
+            for i, chunk in enumerate(result.chunks)
+        ]
+        await rag_service.index_chunks(manual_id, chunks)
+```
+
+Config: `UNSILOED_API_KEY` in `.env`. API base: `https://prod.visionapi.unsiloed.ai`. Max file size: 100MB.
+Supported formats: PDF, DOCX, PPTX, images (PNG, JPEG, TIFF).
 
 #### `app/services/rag.py` - Vector Search
 - `SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")`
@@ -146,7 +163,7 @@ Dependencies: `fastapi`, `uvicorn[standard]`, `nicegui>=2.0`, `sqlalchemy`, `aio
 1. Project setup: `pyproject.toml`, `config.py`, basic `main.py` → verify FastAPI + NiceGUI run
 2. Database: `database.py`, `models.py`, `seed.py` → verify tables created
 3. Admin UI: login + dashboard + upload (without processing)
-4. PDF processing: `pdf_processor.py` + `rag.py` → upload a PDF, verify chunking + indexing
+4. PDF processing: `pdf_processor.py` (Unsiloed.ai) + `rag.py` → upload a PDF, verify parsing + chunking + indexing
 5. API endpoints: auth, sessions, messages with RAG + Claude integration
 6. Browse page for viewing processed content
 
@@ -348,7 +365,33 @@ Voice-first, minimal design:
 
 ---
 
-## Part 3: Shared Configuration
+## Part 3: Documentation (`docs/`)
+
+Store vendor/library reference docs for offline/LLM use:
+
+```
+docs/
+├── unsiloed/
+│   └── llms.txt                  # Unsiloed.ai API reference (from docs.unsiloed.ai/llms.txt)
+├── nicegui/
+│   └── llms.txt                  # NiceGUI reference
+├── whisperkit/
+│   └── llms.txt                  # WhisperKit reference
+└── sherpa-onnx/
+    └── llms.txt                  # Sherpa-ONNX reference
+```
+
+---
+
+## Part 4: Shared Configuration
+
+### `.env.example` (backend)
+```
+ANTHROPIC_API_KEY=
+UNSILOED_API_KEY=
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=changeme
+```
 
 ### `.gitignore` (root)
 ```
