@@ -39,10 +39,10 @@ Key constraints:
 │           │                  │  Unsiloed.ai API → chunks  │  │
 │           ▼                  └────────────┬───────────────┘  │
 │  ┌─────────────────────┐                  │                  │
-│  │  llm.py             │                  ▼                  │
-│  │  Claude API call    │     ┌────────────────────────────┐  │
-│  │  (system + RAG +    │◄───►│  rag.py                    │  │
-│  │   history)          │     │  ChromaDB + sentence-xfmrs │  │
+│  │  session_manager.py  │                  ▼                  │
+│  │  ClaudeSDKClient per │     ┌────────────────────────────┐  │
+│  │  session (Agent SDK) │◄───►│  rag.py                    │  │
+│  │  + MCP search_manual │     │  ChromaDB + sentence-xfmrs │  │
 │  └─────────────────────┘     └────────────────────────────┘  │
 │                                                              │
 │  ┌─────────────────────┐     ┌────────────────────────────┐  │
@@ -86,7 +86,7 @@ backend/
 │   │   ├── __init__.py                    # NEW — package marker
 │   │   ├── pdf_processor.py              # NEW — Unsiloed.ai parse pipeline
 │   │   ├── rag.py                         # NEW — ChromaDB + embeddings
-│   │   ├── llm.py                         # NEW — Anthropic SDK wrapper
+│   │   ├── session_manager.py              # NEW — Claude Agent SDK session manager
 │   │   └── firebase_auth.py              # NEW — Firebase token verification
 │   └── schemas/
 │       ├── __init__.py                    # NEW — package marker
@@ -94,7 +94,8 @@ backend/
 ├── data/                                  # RUNTIME — gitignored
 │   ├── uploads/
 │   ├── processed/
-│   ├── magicball.db
+│   ├── wrenchai.db
+│   ├── sessions/                          # RUNTIME — per-session agent working dirs
 │   └── chromadb/
 └── tests/
     ├── __init__.py                        # NEW
@@ -103,7 +104,7 @@ backend/
     ├── test_database.py                   # NEW — Phase 1
     ├── test_rag.py                        # NEW — Phase 2
     ├── test_pdf_processor.py             # NEW — Phase 3
-    ├── test_llm.py                        # NEW — Phase 4
+    ├── test_session_manager.py             # NEW — Phase 4
     ├── test_api_auth.py                   # NEW — Phase 5
     ├── test_api_sessions.py              # NEW — Phase 5
     └── test_api_messages.py              # NEW — Phase 5
@@ -122,16 +123,21 @@ from pydantic_settings import BaseSettings
 from pathlib import Path
 
 class Settings(BaseSettings):
-    # API keys
-    anthropic_api_key: str = ""
+    # Unsiloed.ai
     unsiloed_api_key: str = ""
+
+    # Claude Agent SDK
+    claude_model: str = "claude-sonnet-4-20250514"
+    session_idle_timeout_minutes: int = 30
+    session_cleanup_interval_minutes: int = 5
+    sessions_dir: str = "data/sessions"
 
     # Admin credentials
     admin_username: str = "admin"
     admin_password: str = "changeme"
 
     # Database
-    database_url: str = "sqlite+aiosqlite:///data/magicball.db"
+    database_url: str = "sqlite+aiosqlite:///data/wrenchai.db"
 
     # ChromaDB
     chromadb_path: str = "data/chromadb"
@@ -267,26 +273,54 @@ Steps:
 6. Update manual: `status=completed`, `chunk_count=len(chunks)`
 7. On error: `status=failed`, `error_message=str(e)`
 
-### 7. `backend/app/services/llm.py` — Claude conversation service
+### 7. `backend/app/services/session_manager.py` — Claude Agent SDK session manager
+
+Uses [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk-python) to maintain long-running Claude sessions per conversation.
 
 ```python
-import anthropic
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, tool, create_sdk_mcp_server
 
-SYSTEM_PROMPT = """You are WrenchAI, an expert car repair assistant. ..."""
+SYSTEM_PROMPT = """You are WrenchAI, an expert car repair and maintenance assistant.
+You help users diagnose issues, perform repairs, and understand their vehicle
+using their specific car's user manual.
+- Give clear, step-by-step instructions suitable for someone working with their hands.
+- Use the search_manual tool to look up relevant sections before answering technical questions.
+- Warn about safety hazards (hot engine, jack stands, battery disconnect, etc.).
+- Keep responses concise but thorough — the user may be listening via text-to-speech.
+"""
 
-class LLMService:
-    def __init__(self, api_key: str) -> None: ...
-    async def generate_response(
-        self,
-        user_message: str,
-        rag_context: list[dict],
-        history: list[dict],
-    ) -> str: ...
+def _build_search_manual_tool(rag_service: RAGService, manual_id: str):
+    """Create a search_manual MCP tool bound to a specific manual's RAG index."""
+    @tool("search_manual", "Search the car's user manual for relevant info.", {"query": str})
+    async def search_manual(args: dict) -> dict:
+        results = rag_service.search(query=args["query"], manual_id=manual_id, top_k=5)
+        # format results as text content blocks
+    return search_manual
+
+@dataclass
+class SessionState:
+    client: ClaudeSDKClient
+    last_activity: datetime
+    manual_id: str
+    session_dir: Path
+
+class SessionManager:
+    def __init__(self, rag_service: RAGService, sessions_dir: str, model: str,
+                 idle_timeout_minutes: int, cleanup_interval_minutes: int) -> None: ...
+    async def start_cleanup_task(self) -> None: ...       # background asyncio task, runs every N min
+    async def get_or_create_session(self, session_id: str, manual_id: str) -> SessionState: ...
+    async def send_message(self, session_id: str, user_message: str, manual_id: str) -> str: ...
+    async def close_session(self, session_id: str) -> None: ...
+    async def close_all(self) -> None: ...                # shutdown: close all sessions, cancel cleanup
 ```
 
-- Builds messages array: system prompt (with RAG context injected), last 10 history messages, current user message
-- Calls `claude-sonnet-4-20250514`
-- Returns `response.content[0].text`
+Key design:
+- **One `ClaudeSDKClient` per conversation session** — SDK maintains context automatically across `query()` calls (no manual history management needed)
+- **RAG exposed as MCP tool** — `search_manual` is registered via `create_sdk_mcp_server()`. Claude decides when/what to search (can search multiple times with refined queries)
+- **`_build_search_manual_tool` closure** — binds the tool to a specific `manual_id` so Claude always searches the correct manual
+- **`asyncio.Lock`** protects `_sessions` dict for concurrent access
+- **Background cleanup loop** — runs every `cleanup_interval_minutes`, closes sessions idle > `idle_timeout_minutes`
+- **Per-session directories** at `data/sessions/{session_id}/` used as agent `cwd`
 
 ### 8. `backend/app/services/firebase_auth.py` — Firebase token verification
 
@@ -341,9 +375,12 @@ class ManualSearchResponse(BaseModel):
 
 ```python
 from fastapi import Depends, Header, HTTPException
+from app.services.session_manager import SessionManager
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]: ...
 async def get_current_user(authorization: str = Header(...)) -> str: ...  # returns Firebase UID
+def get_session_manager() -> SessionManager: ...  # returns the global SessionManager instance
+def set_session_manager(sm: SessionManager) -> None: ...  # called once at startup
 ```
 
 ### 11. `backend/app/api/auth.py` — Auth endpoint
@@ -379,7 +416,7 @@ async def send_message(session_id: str, req: MessageCreate, user_id: str = Depen
 async def get_messages(session_id: str, user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[MessageResponse]: ...
 ```
 
-`send_message` flow: verify ownership → save user msg → RAG search → Claude call → save assistant msg → return.
+`send_message` flow: verify ownership → save user msg → `session_manager.send_message()` → save assistant msg → return. RAG search happens inside the agent via the `search_manual` MCP tool (no explicit RAG call in the endpoint).
 
 ### 14. `backend/app/api/manuals.py` — Manual search endpoint
 
@@ -416,7 +453,22 @@ async def lifespan(app: FastAPI):
     await init_db()
     async with async_session() as db:
         await seed_admin(db)
+
+    # Initialize services
+    rag_service = RAGService(settings.chromadb_path)
+    session_manager = SessionManager(
+        rag_service=rag_service,
+        sessions_dir=settings.sessions_dir,
+        model=settings.claude_model,
+        idle_timeout_minutes=settings.session_idle_timeout_minutes,
+        cleanup_interval_minutes=settings.session_cleanup_interval_minutes,
+    )
+    await session_manager.start_cleanup_task()
+    set_session_manager(session_manager)
+
     yield
+
+    await session_manager.close_all()
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(api_router)
@@ -631,62 +683,73 @@ Launch Agent (subagent_type: "general-purpose", model: "claude-opus-4-6"):
 
 ---
 
-### Phase 4: LLM Service (Claude)
+### Phase 4: Session Manager (Claude Agent SDK)
 
-**Goal**: Implement the Claude conversation service that takes user input, RAG context, and history, and returns an AI response.
+**Goal**: Implement the Claude Agent SDK session manager with per-session clients, idle cleanup, and a custom MCP tool for RAG search.
 
 **RED — Write failing tests**
 
-Test file: `backend/tests/test_llm.py`
+Test file: `backend/tests/test_session_manager.py`
 
 | Test | What it checks |
 |------|----------------|
-| `test_generate_response_returns_string` | `generate_response()` returns a non-empty string |
-| `test_generate_response_includes_rag_in_system` | System prompt sent to Claude contains the RAG context text |
-| `test_generate_response_includes_history` | Messages array sent to Claude includes conversation history |
-| `test_generate_response_caps_history_at_10` | Only last 10 history messages are included |
-| `test_generate_response_uses_correct_model` | API call uses `claude-sonnet-4-20250514` |
-| `test_system_prompt_contains_persona` | System prompt contains car repair expert persona instructions |
+| `test_get_or_create_session_creates_new` | First call creates a `SessionState` and adds to `_sessions` dict |
+| `test_get_or_create_session_returns_existing` | Second call with same `session_id` returns the same `SessionState` |
+| `test_get_or_create_session_creates_directory` | Session directory `data/sessions/{session_id}/` is created |
+| `test_send_message_returns_string` | `send_message()` returns a non-empty string response |
+| `test_send_message_updates_last_activity` | `last_activity` is updated after `send_message()` |
+| `test_send_message_calls_query_and_receive` | Client's `query()` is called with user message, then `receive_response()` is iterated |
+| `test_close_session_removes_from_dict` | After `close_session()`, session is no longer in `_sessions` |
+| `test_close_session_calls_aexit` | `close_session()` calls `__aexit__` on the client |
+| `test_close_idle_sessions` | Sessions idle longer than timeout are closed automatically |
+| `test_active_sessions_not_closed` | Sessions with recent activity survive the cleanup sweep |
+| `test_close_all_cleans_everything` | `close_all()` closes all sessions and cancels the cleanup task |
+| `test_search_manual_tool_returns_results` | The `search_manual` MCP tool function returns formatted RAG results |
+| `test_search_manual_tool_no_results` | The tool returns "No relevant sections found" when RAG returns empty |
+| `test_system_prompt_contains_persona` | `SYSTEM_PROMPT` contains "WrenchAI" and car repair guidance |
 
-Mock `anthropic.AsyncAnthropic` in all tests.
+Mock `ClaudeSDKClient` as async context manager. Mock `query()` and `receive_response()`. Mock `RAGService` for tool tests.
 
-Run: `cd backend && uv run pytest tests/test_llm.py -v` — expect FAIL (ImportError).
+Run: `cd backend && uv run pytest tests/test_session_manager.py -v` — expect FAIL (ImportError).
 
 **GREEN — Implement**
 
-1. Create `backend/app/services/llm.py`
-2. Define `SYSTEM_PROMPT` constant with car repair expert persona
-3. Implement `LLMService.__init__(self, api_key: str)` — creates `anthropic.AsyncAnthropic` client
-4. Implement `LLMService.generate_response(self, user_message, rag_context, history)`:
-   - Build system prompt: base persona + formatted RAG context
-   - Trim history to last 10 messages
-   - Build messages array: history + `{"role": "user", "content": user_message}`
-   - Call `self._client.messages.create(model="claude-sonnet-4-20250514", system=system, messages=messages, max_tokens=1024)`
-   - Return `response.content[0].text`
+1. Create `backend/app/services/session_manager.py`
+2. Define `SYSTEM_PROMPT` constant with WrenchAI car repair persona (mentions `search_manual` tool)
+3. Implement `_build_search_manual_tool(rag_service, manual_id)` — returns `@tool`-decorated function bound to the manual
+4. Implement `SessionState` dataclass with `client`, `last_activity`, `manual_id`, `session_dir`
+5. Implement `SessionManager`:
+   - `__init__`: stores config, creates empty `_sessions` dict and `asyncio.Lock`
+   - `start_cleanup_task()`: launches background `asyncio.Task` that calls `_close_idle_sessions()` periodically
+   - `get_or_create_session(session_id, manual_id)`: creates session dir, builds MCP server with `search_manual` tool, creates `ClaudeSDKClient` with `ClaudeAgentOptions`, enters async context
+   - `send_message(session_id, user_message, manual_id)`: gets/creates session, calls `client.query()`, collects `TextBlock` content from `receive_response()`, returns joined text
+   - `close_session(session_id)`: pops from dict, calls `client.__aexit__()`
+   - `close_all()`: cancels cleanup task, closes all sessions
 
-Run: `cd backend && uv run pytest tests/test_llm.py -v` — expect PASS.
+Run: `cd backend && uv run pytest tests/test_session_manager.py -v` — expect PASS.
 
 **REVIEW+FIX CYCLE**
 
 ```
 Launch Agent (subagent_type: "general-purpose", model: "claude-opus-4-6"):
-  "Review Phase 4 of plans/3-backend.md: LLM service with Claude.
-   Files to review: backend/app/services/llm.py, backend/tests/test_llm.py.
+  "Review Phase 4 of plans/1-backend-implementation.md: Session Manager with Claude Agent SDK.
+   Files to review: backend/app/services/session_manager.py, backend/tests/test_session_manager.py.
    Check: all tests pass (cd backend && uv run pytest tests/ -v), code matches plan spec, no regressions.
-   Phase-specific: Is the system prompt well-structured for a car repair assistant? Does RAG context get
-   properly formatted and injected into the system prompt? Is history correctly capped at 10 messages?
-   Is the model ID correct (claude-sonnet-4-20250514)? Are the Anthropic API params correct?
+   Phase-specific: Does get_or_create_session properly handle concurrent access via asyncio.Lock?
+   Does close_session call __aexit__ on the client? Does the MCP tool correctly bind to the manual_id?
+   Does the cleanup loop close sessions idle > 30 min? Is the system prompt appropriate for a car repair assistant?
+   Does send_message correctly collect all TextBlock content from the response stream?
    If issues found: fix them, re-run tests, and review again. Repeat until review is clean.
    When review is clean and all tests pass, report DONE with a summary of changes made."
 ```
 
 **FULL SUITE**: `cd backend && uv run pytest tests/ -v` — no regressions from Phase 1-3.
 
-**COMMIT**: `/commit` with message `"Phase 4: LLM service with Claude conversation support"`
+**COMMIT**: `/commit` with message `"Phase 4: Session manager with Claude Agent SDK and MCP search tool"`
 
 **Files Created**:
-- `backend/app/services/llm.py`
-- `backend/tests/test_llm.py`
+- `backend/app/services/session_manager.py`
+- `backend/tests/test_session_manager.py`
 
 ---
 
@@ -722,7 +785,7 @@ Test file: `backend/tests/test_api_messages.py`
 | `test_get_messages` | GET `/api/sessions/{id}/messages` returns messages in order |
 | `test_get_messages_empty_session` | GET on new session returns empty list |
 
-Use `httpx.AsyncClient` with FastAPI `TestClient`. Mock Firebase auth to return a test UID. Mock LLM service. Use in-memory DB + temp RAG.
+Use `httpx.AsyncClient` with FastAPI `TestClient`. Mock Firebase auth to return a test UID. Mock `SessionManager.send_message`. Use in-memory DB.
 
 Run: `cd backend && uv run pytest tests/test_api_auth.py tests/test_api_sessions.py tests/test_api_messages.py -v` — expect FAIL (ImportError).
 
@@ -730,14 +793,14 @@ Run: `cd backend && uv run pytest tests/test_api_auth.py tests/test_api_sessions
 
 1. Create `backend/app/schemas/api.py` — all Pydantic request/response models
 2. Create `backend/app/services/firebase_auth.py` — `init_firebase()`, `verify_token()`
-3. Create `backend/app/api/deps.py` — `get_db()` (reuses database.get_db), `get_current_user()` (extracts Bearer token, calls verify_token)
+3. Create `backend/app/api/deps.py` — `get_db()` (reuses database.get_db), `get_current_user()` (extracts Bearer token, calls verify_token), `get_session_manager()` / `set_session_manager()`
 4. Create `backend/app/api/auth.py` — `POST /auth/verify`
 5. Create `backend/app/api/sessions.py` — `POST /sessions/`, `GET /sessions/`
-6. Create `backend/app/api/messages.py` — `POST /sessions/{id}/message`, `GET /sessions/{id}/messages`
+6. Create `backend/app/api/messages.py` — `POST /sessions/{id}/message`, `GET /sessions/{id}/messages` (uses `SessionManager` dependency)
 7. Create `backend/app/api/manuals.py` — `POST /manuals/search`
 8. Create `backend/app/api/router.py` — aggregate all routers under `/api`
-9. Update `backend/app/main.py` — register `api_router`, initialize LLM and RAG services in lifespan
-10. Update `backend/tests/conftest.py` — add `client` fixture with dependency overrides for DB, auth, LLM, RAG
+9. Update `backend/app/main.py` — register `api_router`, initialize `SessionManager` + RAG in lifespan, call `close_all()` on shutdown
+10. Update `backend/tests/conftest.py` — add `client` fixture with dependency overrides for DB, auth, `SessionManager`
 
 Run: `cd backend && uv run pytest tests/test_api_auth.py tests/test_api_sessions.py tests/test_api_messages.py -v` — expect PASS.
 
@@ -752,9 +815,10 @@ Launch Agent (subagent_type: "general-purpose", model: "claude-opus-4-6"):
    backend/app/main.py, backend/tests/conftest.py, backend/tests/test_api_auth.py,
    backend/tests/test_api_sessions.py, backend/tests/test_api_messages.py.
    Check: all tests pass (cd backend && uv run pytest tests/ -v), code matches plan spec, no regressions.
-   Phase-specific: Does send_message correctly chain RAG search → LLM call → DB save? Is session ownership
-   checked before message operations? Does get_current_user properly extract the Bearer token? Are dependency
-   overrides in test fixtures complete and correct? Are all routes properly prefixed under /api?
+   Phase-specific: Does send_message correctly call session_manager.send_message() and save both user+assistant
+   messages to DB? Is session ownership checked before message operations? Does get_current_user properly extract
+   the Bearer token? Are dependency overrides in test fixtures complete and correct? Are all routes properly
+   prefixed under /api?
    If issues found: fix them, re-run tests, and review again. Repeat until review is clean.
    When review is clean and all tests pass, report DONE with a summary of changes made."
 ```
@@ -778,8 +842,8 @@ Launch Agent (subagent_type: "general-purpose", model: "claude-opus-4-6"):
 - `backend/tests/test_api_messages.py`
 
 **Files Modified**:
-- `backend/app/main.py` — add router registration, service initialization
-- `backend/tests/conftest.py` — add client fixture with dependency overrides
+- `backend/app/main.py` — add router registration, SessionManager + RAG initialization in lifespan
+- `backend/tests/conftest.py` — add client fixture with dependency overrides for DB, auth, SessionManager
 
 ---
 
