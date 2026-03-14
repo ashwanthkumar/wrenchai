@@ -1,3 +1,4 @@
 chroma_db/
 output/
 .env
+images/*.*

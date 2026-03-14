@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.5",
     "claude-agent-sdk>=0.1.48",
+    "fastapi>=0.135.1",
     "python-dotenv>=1.2.2",
     "unsiloed-sdk>=0.1.7",
+    "uvicorn>=0.41.0",
     "voyageai>=0.3.7",
 ]
