@@ -128,6 +128,8 @@ async def _ask_claude(question: str, image_paths: list[Path] | None = None) -> M
             "type": "json_schema",
             "schema": ANSWER_SCHEMA,
         },
+        extra_args={"debug-to-stderr": None},
+        stderr=lambda line: print(line, file=sys.stderr),
     )
     if image_paths:
         allowed_tools.append("Read")
